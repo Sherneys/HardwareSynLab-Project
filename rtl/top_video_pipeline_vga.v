@@ -1,34 +1,38 @@
 //==============================================================================
-// top_video_pipeline_vga.v   (EXTRA-CREDIT VARIANT - full 640x480)
+// top_video_pipeline_vga.v   (EXTRA-CREDIT VARIANT - full 640x480 RGB121)
 //------------------------------------------------------------------------------
-// Same pipeline as top_video_pipeline.v but configured so that the frame
-// buffer stores one pixel per VGA pixel (no pixel-doubling), giving a real
-// 640x480 display rather than an upscaled 320x240.
+// Real 640x480 frame buffer with 4-bit RGB121 colour (1 bit R + 2 bits G + 1 bit B
+// = 16 distinct colours). Same memory budget as the previous grayscale variant,
+// just packed differently.
 //
 // Memory budget
 // -------------
-//   Basys 3 has 1,800 Kb of block RAM.
-//   640 x 480 pixels = 307,200 pixels total.
-//   1,800,000 / 307,200 = 5.86 bits/pixel max.
-// So we cannot afford full-colour RGB444 (12 bpp) nor even RGB332 (8 bpp).
-// The trade-off chosen here is 4-bit grayscale:
-//   307,200 x 4 = 1,228,800 bits ≈ 1,200 Kb -> ~35 of 50 BRAM tiles.
+//   Basys 3 has 1,800 Kb of BRAM. 640 × 480 = 307,200 pixels.
+//   307,200 × 4 = 1,228,800 bits  ≈  1,200 Kb  →  ~35 of 50 BRAM tiles.
 //
-// The grayscale value is computed at capture time from the camera's RGB565
-// output using the approximation Y = (R + 2G + B) / 4 (same as filter_unit).
+// Why RGB121 (and not full colour)?
+//   We have only 5.86 bits/pixel available for full VGA. RGB444 (12 bpp) needs
+//   3.7 Mb — over 2× the BRAM. RGB121 fits the same memory as 4-bit grayscale
+//   but gives crude colour: 2 reds × 4 greens × 2 blues = 16 colours, similar
+//   to early 1980s VGA / EGA palettes.
 //
-// Filters available in this variant
-// ---------------------------------
-//   000 : raw grayscale
-//   001 : (no-op, same as raw - already grayscale)
+// Pixel format in BRAM (4 bits per pixel):
+//   bit 3   : R   (0 = no red,    1 = full red)
+//   bit 2:1 : G   (00 = no green, 11 = full green, 4 levels)
+//   bit 0   : B   (0 = no blue,   1 = full blue)
+//
+// Capture extracts the top bit of R, top 2 bits of G, top bit of B from the
+// RGB565 stream. Display expands those 4 bits back to RGB444 for the DAC.
+//
+// Filters available
+//   000 : raw colour
+//   001 : grayscale (Y = (R + 2G + B) / 4)
 //   010 : invert
-//   110 : threshold (binary image)
-// The colour-channel-isolation filter makes no sense on grayscale storage
-// so it is disabled here. Use top_video_pipeline.v for full-colour filters.
+//   110 : threshold (binary)
+// Colour-channel isolation filters are skipped here (only 1 bit of R/B
+// makes them useless). Use top_video_pipeline.v for full-RGB filtering.
 //
-// How to use: in Vivado, set THIS file as the top module (instead of
-// top_video_pipeline.v) to synthesise the 640x480 extra-credit build. The
-// constraint file basys3.xdc works unchanged.
+// How to use: in Vivado, set THIS file as top instead of top_video_pipeline.v.
 //==============================================================================
 `timescale 1ns / 1ps
 
@@ -53,10 +57,9 @@ module top_video_pipeline_vga (
     inout  wire        ov_siod
 );
 
-    // Reset synchroniser
-    wire rst_raw = btnC | sw[15];
+    // Reset (centre pushbutton btnC, synchronised into 100 MHz domain)
     reg  [1:0] rst_sync;
-    always @(posedge clk_100m) rst_sync <= {rst_sync[0], rst_raw};
+    always @(posedge clk_100m) rst_sync <= {rst_sync[0], btnC};
     wire rst_n = ~rst_sync[1];
 
     // Clocks
@@ -70,11 +73,10 @@ module top_video_pipeline_vga (
     assign ov_reset_n = rst_n;
 
     // SCCB init --------------------------------------------------------------
-    // NOTE: For real 640x480 you will need to reconfigure the OV7670 to VGA
-    // output. That means replacing register 0x12 COM7 with 0x00 (VGA+YUV) or
-    // 0x04 (VGA+RGB), removing the QVGA scaling writes, and setting 0x0C
-    // (COM3) with scaling OFF. See the table inside ov7670_init.v and edit
-    // ROM entries 1..9 before synthesising this top module.
+    // ov7670_init.v already programs the camera for native VGA + RGB565 +
+    // manual white-balance gains + denoise, so no edits are needed here.
+    // Building this variant: in Vivado, set top_video_pipeline_vga as the
+    // top-level module (Sources → right-click → Set as Top), re-synthesize.
     wire       sccb_ready, sccb_start;
     wire [7:0] sccb_slave, sccb_reg_addr, sccb_reg_data;
     wire       cfg_done;
@@ -101,11 +103,12 @@ module top_video_pipeline_vga (
     localparam FB_DEPTH = FRAME_W * FRAME_H; // 307,200
     localparam FB_AW    = 19;                // ceil(log2(307200)) = 19
 
-    // Inline capture logic (variant): reassembles 16-bit RGB565 from the
-    // camera, converts to 4-bit grayscale on the fly, and writes one nibble
-    // per pixel into the frame buffer. Keeping this inline (vs. a second
-    // module) avoids duplicating the file and makes the memory-size
-    // contrast with the RGB444 version obvious.
+    // Inline capture (RGB565 -> RGB121, 1 nibble per VGA pixel).
+    // Phase 0 saves the HIGH byte (RRRRRGGG); phase 1 has the LOW byte
+    // (GGGBBBBB) on ov_data. We pack the top bits of each channel:
+    //   bit 3   : R   = byte_hi[7]                  (top bit of R[4:0])
+    //   bit 2:1 : G   = byte_hi[2:1]                (top 2 bits of G[5:0])
+    //   bit 0   : B   = ov_data[4]                  (top bit of B[4:0])
     reg        byte_toggle;
     reg [7:0]  byte_hi;
     reg [9:0]  col;
@@ -113,15 +116,12 @@ module top_video_pipeline_vga (
     reg        cap_we;
     reg [FB_AW-1:0] cap_waddr;
     reg [3:0]  cap_wdata;
+    reg [FB_AW-1:0] waddr_lin;
 
-    // RGB565 -> 4-bit luma. Take the top 4 bits of each channel (same as
-    // RGB444 down-convert), apply (R + 2G + B) / 4 approximation, drop to
-    // 4 bits.
-    wire [3:0] r4 = byte_hi[7:4];
-    wire [3:0] g4 = {byte_hi[2:0], ov_data[7]};
-    wire [3:0] b4 = ov_data[4:1];
-    wire [5:0] y6 = {2'b00, r4} + {1'b0, g4, 1'b0} + {2'b00, b4};
-    wire [3:0] y4 = y6[5:2];
+    wire       r1 = byte_hi[7];
+    wire [1:0] g2 = byte_hi[2:1];
+    wire       b1 = ov_data[4];
+    wire [3:0] rgb121 = {r1, g2, b1};
 
     always @(posedge ov_pclk) begin
         if (ov_vsync) begin
@@ -129,6 +129,7 @@ module top_video_pipeline_vga (
             col         <= 10'd0;
             row         <= 10'd0;
             cap_we      <= 1'b0;
+            waddr_lin   <= {FB_AW{1'b0}};
         end else begin
             cap_we <= 1'b0;
             if (ov_href) begin
@@ -136,9 +137,12 @@ module top_video_pipeline_vga (
                 if (!byte_toggle) begin
                     byte_hi <= ov_data;
                 end else begin
-                    cap_wdata <= y4;
-                    cap_waddr <= row * FRAME_W + col;
-                    cap_we    <= (col < FRAME_W) && (row < FRAME_H);
+                    cap_wdata <= rgb121;
+                    if (waddr_lin < FB_DEPTH) begin
+                        cap_waddr <= waddr_lin;
+                        cap_we    <= 1'b1;
+                        waddr_lin <= waddr_lin + {{(FB_AW-1){1'b0}}, 1'b1};
+                    end
                     if (col < FRAME_W - 1) col <= col + 10'd1;
                 end
             end else begin
@@ -170,22 +174,59 @@ module top_video_pipeline_vga (
         .pixel_tick()
     );
 
-    // Native read address (no pixel-doubling)
-    assign fb_raddr = v_cnt * FRAME_W + h_cnt;
+    // Look one pixel ahead to compensate for BRAM's 1-cycle read latency.
+    // Without this, the image is shifted 1 pixel right and the leftmost
+    // column shows garbage from the last blanking-period BRAM read.
+    wire [9:0] h_rd_next = (h_cnt == 10'd799) ? 10'd0 : h_cnt + 10'd1;
+    wire [9:0] v_rd_next = (h_cnt == 10'd799) ?
+                           ((v_cnt == 10'd524) ? 10'd0 : v_cnt + 10'd1) : v_cnt;
+    wire [9:0] h_rd_sat  = (h_rd_next >= 10'd640) ? 10'd639 : h_rd_next;
+    wire [9:0] v_rd_sat  = (v_rd_next >= 10'd480) ? 10'd479 : v_rd_next;
+    // 640 = 512 + 128, avoid runtime multiplier
+    wire [FB_AW-1:0] row_x640 = (v_rd_sat << 9) + (v_rd_sat << 7);
+    assign fb_raddr = row_x640 + {{(FB_AW-10){1'b0}}, h_rd_sat};
 
-    // Grayscale filter selection
-    reg [3:0] luma_filt;
+    // Decode RGB121 nibble back into RGB444 channels for the VGA DAC:
+    //   R: 1 bit -> 0x0 or 0xF
+    //   G: 2 bits -> 0x0 / 0x5 / 0xA / 0xF (mapped 4 levels across full range)
+    //   B: 1 bit -> 0x0 or 0xF
+    wire [3:0] r_dec = {4{fb_rdata[3]}};
+    wire [3:0] g_dec = {fb_rdata[2:1], fb_rdata[2:1]};
+    wire [3:0] b_dec = {4{fb_rdata[0]}};
+
+    // (R + 2G + B) / 4 luma for grayscale and threshold filters
+    wire [5:0] y6   = {2'b00, r_dec} + {1'b0, g_dec, 1'b0} + {2'b00, b_dec};
+    wire [3:0] luma = y6[5:2];
+
+    reg [3:0] r_out, g_out, b_out;
     always @* begin
         case (sw[2:0])
-            3'b010 : luma_filt = ~fb_rdata;                 // invert
-            3'b110 : luma_filt = (fb_rdata >= 4'd8) ? 4'hF : 4'h0; // threshold
-            default: luma_filt = fb_rdata;                  // raw/grayscale
+            3'b010: begin                              // invert
+                r_out = ~r_dec;
+                g_out = ~g_dec;
+                b_out = ~b_dec;
+            end
+            3'b001: begin                              // grayscale
+                r_out = luma;
+                g_out = luma;
+                b_out = luma;
+            end
+            3'b110: begin                              // threshold (binary)
+                r_out = (luma >= 4'd8) ? 4'hF : 4'h0;
+                g_out = (luma >= 4'd8) ? 4'hF : 4'h0;
+                b_out = (luma >= 4'd8) ? 4'hF : 4'h0;
+            end
+            default: begin                             // raw colour
+                r_out = r_dec;
+                g_out = g_dec;
+                b_out = b_dec;
+            end
         endcase
     end
 
-    assign vga_r = video_on ? luma_filt : 4'h0;
-    assign vga_g = video_on ? luma_filt : 4'h0;
-    assign vga_b = video_on ? luma_filt : 4'h0;
+    assign vga_r = video_on ? r_out : 4'h0;
+    assign vga_g = video_on ? g_out : 4'h0;
+    assign vga_b = video_on ? b_out : 4'h0;
 
     // LEDs
     reg [1:0] vsync_sync;
@@ -194,15 +235,15 @@ module top_video_pipeline_vga (
     reg       heartbeat;
     always @(posedge clk_25m) begin
         if (!rst_n) begin vsync_cnt <= 0; heartbeat <= 0; end
-        else if (vsync_sync[1] && !vsync_sync[0]) begin
+        else if (!vsync_sync[1] && vsync_sync[0]) begin
             if (vsync_cnt == 6'd29) begin vsync_cnt <= 0; heartbeat <= ~heartbeat; end
             else vsync_cnt <= vsync_cnt + 1;
         end
     end
 
-    assign led[0]    = cfg_done;
-    assign led[1]    = heartbeat;
-    assign led[4:2]  = sw[2:0];
+    assign led[0]    = cfg_done;   // SCCB config finished
+    assign led[1]    = heartbeat;  // camera vsync heartbeat
+    assign led[4:2]  = sw[2:0];    // filter mode echo
     assign led[15:5] = 11'd0;
 
 endmodule

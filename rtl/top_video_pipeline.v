@@ -1,31 +1,18 @@
 //==============================================================================
-// top_video_pipeline.v   (REVISED)
+// top_video_pipeline.v
 //------------------------------------------------------------------------------
-// OV7670 -> frame buffer -> VGA pipeline. Now with:
+// OV7670 -> ov7670_capture -> dual-clock BRAM -> vga_sync -> filter_unit -> VGA
 //
-//  * sw[14] = 1 : DEBUG test-pattern mode. The camera data path is bypassed
-//                 and a colour gradient is displayed. Use this first to
-//                 verify VGA cabling + sync + pixel clock + RGB pins BEFORE
-//                 worrying about camera configuration. If the test pattern
-//                 does NOT look like a clean 8-band colour bar, the issue
-//                 is on the VGA side, not the camera side.
+// Capture module does in-FPGA 2x2 box-average downsampling so the OV7670
+// stays in native 640x480 VGA mode and we keep a 320x240 RGB444 frame buffer
+// (~922 Kb of BRAM, fits comfortably).
 //
-//  * Camera side is unchanged in concept, but the capture module now does
-//    in-FPGA 2x2 downsampling, so the OV7670 stays in native VGA mode.
+// BRAM read latency: we advance the read address one cycle early so the
+// pixel arriving at the filter_unit matches the (h_cnt, v_cnt) being shown.
 //
-//  * BRAM read-latency phase corrected: we advance the read address one
-//    cycle early so the pixel that arrives at the filter_unit matches the
-//    (h_cnt, v_cnt) currently being displayed.
-//
-//  * sw[13] = 1 : bypass filter_unit (display raw frame-buffer contents).
-//                 Useful while debugging, lets you see exactly what the
-//                 camera wrote into BRAM without any filter interpretation.
-//
-// Switch map summary
+// Switch map
 //   sw[2:0]  : filter mode selector (see filter_unit.v)
-//   sw[13]   : bypass filter_unit      (debug)
-//   sw[14]   : show test pattern        (debug)
-//   sw[15]   : secondary reset
+//   btnC     : reset
 //==============================================================================
 `timescale 1ns / 1ps
 
@@ -51,11 +38,10 @@ module top_video_pipeline (
 );
 
     //--------------------------------------------------------------------------
-    // Reset
+    // Reset (centre pushbutton btnC, synchronised into 100 MHz domain)
     //--------------------------------------------------------------------------
-    wire rst_raw = btnC | sw[15];
     reg  [1:0] rst_sync;
-    always @(posedge clk_100m) rst_sync <= {rst_sync[0], rst_raw};
+    always @(posedge clk_100m) rst_sync <= {rst_sync[0], btnC};
     wire rst_n = ~rst_sync[1];
 
     //--------------------------------------------------------------------------
@@ -110,13 +96,13 @@ module top_video_pipeline (
         .CAM_W  (640),     .CAM_H  (480),
         .ADDR_W (FB_AW)
     ) u_capture (
-        .pclk (ov_pclk),
-        .vsync(ov_vsync),
-        .href (ov_href),
-        .data (ov_data),
-        .we   (cap_we),
-        .waddr(cap_waddr),
-        .wdata(cap_wdata)
+        .pclk      (ov_pclk),
+        .vsync     (ov_vsync),
+        .href      (ov_href),
+        .data      (ov_data),
+        .we        (cap_we),
+        .waddr     (cap_waddr),
+        .wdata     (cap_wdata)
     );
 
     //--------------------------------------------------------------------------
@@ -167,25 +153,9 @@ module top_video_pipeline (
     wire [9:0] src_col_sat = (src_col_next >= FRAME_W) ? FRAME_W-1 : src_col_next;
     wire [9:0] src_row_sat = (src_row_next >= FRAME_H) ? FRAME_H-1 : src_row_next;
 
-    assign fb_raddr = src_row_sat * FRAME_W + src_col_sat;
-
-    //--------------------------------------------------------------------------
-    // Test pattern (debug mode - sw[14] = 1)
-    // Generates a clean 8-band colour bar so you can confirm VGA is good.
-    //--------------------------------------------------------------------------
-    reg [3:0] tp_r, tp_g, tp_b;
-    always @* begin
-        case (h_cnt[9:7])  // 8 bands of 128 pixels each
-            3'd0: {tp_r, tp_g, tp_b} = 12'hFFF; // white
-            3'd1: {tp_r, tp_g, tp_b} = 12'hFF0; // yellow
-            3'd2: {tp_r, tp_g, tp_b} = 12'h0FF; // cyan
-            3'd3: {tp_r, tp_g, tp_b} = 12'h0F0; // green
-            3'd4: {tp_r, tp_g, tp_b} = 12'hF0F; // magenta
-            3'd5: {tp_r, tp_g, tp_b} = 12'hF00; // red
-            3'd6: {tp_r, tp_g, tp_b} = 12'h00F; // blue
-            3'd7: {tp_r, tp_g, tp_b} = 12'h000; // black
-        endcase
-    end
+    // 320 = 256 + 64, avoid runtime multiplier
+    wire [FB_AW-1:0] row_x320 = (src_row_sat << 8) + (src_row_sat << 6);
+    assign fb_raddr = row_x320 + {{(FB_AW-10){1'b0}}, src_col_sat};
 
     //--------------------------------------------------------------------------
     // Filter unit
@@ -201,36 +171,9 @@ module top_video_pipeline (
         .b_out    (b_filt)
     );
 
-    //--------------------------------------------------------------------------
-    // Output select:
-    //   sw[14] = 1 -> test pattern
-    //   sw[13] = 1 -> raw frame buffer (no filter) - debug
-    //   else       -> filtered camera video
-    //--------------------------------------------------------------------------
-    reg [3:0] vga_r_reg, vga_g_reg, vga_b_reg;
-    always @* begin
-        if (!video_on) begin
-            vga_r_reg = 4'h0;
-            vga_g_reg = 4'h0;
-            vga_b_reg = 4'h0;
-        end else if (sw[14]) begin
-            vga_r_reg = tp_r;
-            vga_g_reg = tp_g;
-            vga_b_reg = tp_b;
-        end else if (sw[13]) begin
-            vga_r_reg = fb_rdata[11:8];
-            vga_g_reg = fb_rdata[ 7:4];
-            vga_b_reg = fb_rdata[ 3:0];
-        end else begin
-            vga_r_reg = r_filt;
-            vga_g_reg = g_filt;
-            vga_b_reg = b_filt;
-        end
-    end
-
-    assign vga_r = vga_r_reg;
-    assign vga_g = vga_g_reg;
-    assign vga_b = vga_b_reg;
+    assign vga_r = r_filt;
+    assign vga_g = g_filt;
+    assign vga_b = b_filt;
 
     //--------------------------------------------------------------------------
     // LED status
@@ -243,7 +186,7 @@ module top_video_pipeline (
         if (!rst_n) begin
             vsync_cnt <= 6'd0;
             heartbeat <= 1'b0;
-        end else if (vsync_sync[1] && !vsync_sync[0]) begin
+        end else if (!vsync_sync[1] && vsync_sync[0]) begin
             if (vsync_cnt == 6'd29) begin
                 vsync_cnt <= 6'd0;
                 heartbeat <= ~heartbeat;
@@ -256,9 +199,6 @@ module top_video_pipeline (
     assign led[0]    = cfg_done;   // SCCB config finished
     assign led[1]    = heartbeat;  // camera vsync heartbeat
     assign led[4:2]  = sw[2:0];    // filter mode echo
-    assign led[13]   = sw[13];
-    assign led[14]   = sw[14];
-    assign led[15]   = sw[15];
-    assign led[12:5] = 8'd0;
+    assign led[15:5] = 11'd0;
 
 endmodule

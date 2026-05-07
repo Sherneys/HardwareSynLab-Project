@@ -33,9 +33,10 @@ module clock_gen (
         else        div <= div + 2'b01;
     end
 
-    // div[1] toggles every 2 input clocks -> 25 MHz square wave
-    assign clk_25m  = div[1];
-    assign xclk_25m = div[1];
+    // Route div[1] through a global clock buffer so both clk_25m and xclk_25m
+    // are driven from the same BUFG output, eliminating fabric clock skew.
+    BUFG u_bufg (.I(div[1]), .O(clk_25m));
+    assign xclk_25m = clk_25m;
 
     // --------------------------------------------------------------------------
     // Alternative: use an MMCM for glitch-free clocks. Instantiate the Clocking
