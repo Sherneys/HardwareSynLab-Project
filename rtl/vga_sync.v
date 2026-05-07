@@ -86,7 +86,15 @@ module vga_sync #(
         end
     end
 
-    assign video_on   = (h_cnt < H_VISIBLE) && (v_cnt < V_VISIBLE);
+    reg video_on_reg;
+    always @(posedge clk_25m) begin
+        if (!rst_n)
+            video_on_reg <= 1'b0;
+        else
+            video_on_reg <= (h_cnt < H_VISIBLE) && (v_cnt < V_VISIBLE);
+    end
+
+    assign video_on   = video_on_reg;
     assign h_count    = h_cnt;
     assign v_count    = v_cnt;
     assign pixel_tick = 1'b1; // every rising edge of clk_25m is a pixel

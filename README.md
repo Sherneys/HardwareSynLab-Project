@@ -109,7 +109,7 @@ constraints/
 
 **Switch layout on the board**
 - `sw[2:0]` : filter mode selector
-- `sw[15]`  : secondary reset (in addition to center pushbutton `btnC`)
+- `btnC`    : reset
 - `led[0]`  : lit once OV7670 configuration writes have finished
 - `led[1]`  : heartbeat (toggles ~once per second from camera VSYNC)
 - `led[4:2]`: echoes the current filter mode

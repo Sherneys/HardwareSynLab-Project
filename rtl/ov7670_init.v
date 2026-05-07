@@ -36,8 +36,9 @@ module ov7670_init #(
 
     assign slave_addr = 8'h42;          // OV7670 write address
 
-    // OV7670 needs >= 300 us of XCLK after a software reset. 1 ms is safe.
-    localparam integer RESET_DELAY = INPUT_CLK_HZ / 1_000;
+    // Wait >= 1 full frame period (16.7 ms @ 60 fps) after reset before writing
+    // subsequent registers. 20 ms is conservative and safe.
+    localparam integer RESET_DELAY = INPUT_CLK_HZ / 50;
 
     // -----------------------------------------------------------------
     // Minimal, vetted register set for VGA + RGB565.
@@ -49,24 +50,24 @@ module ov7670_init #(
             case (idx)
                 // ---- software reset ----
                 0  : rom = 16'h12_80;  // COM7: reset
-                // ---- output format ----
-                1  : rom = 16'h12_04;  // COM7: RGB output, VGA resolution
+                // ---- output format: RGB565 ----
+                1  : rom = 16'h12_04;  // COM7: RGB output mode, VGA resolution
                 2  : rom = 16'h11_00;  // CLKRC: use XCLK directly, no prescale
                 3  : rom = 16'h0C_00;  // COM3: no scaling, no DCW
                 4  : rom = 16'h3E_00;  // COM14: no scaling, normal pclk
-                5  : rom = 16'h8C_00;  // RGB444: disabled (so RGB565 wins)
+                5  : rom = 16'h8C_00;  // RGB444: disabled (RGB565 selected by COM15)
                 6  : rom = 16'h04_00;  // COM1: no CCIR656
-                7  : rom = 16'h40_D0;  // COM15: full output range + RGB565
-                8  : rom = 16'h3A_04;  // TSLB: explicit output byte order
-                9  : rom = 16'h14_38;  // COM9: AGC ceiling 16x
-                10 : rom = 16'h4F_B3;  // MTX1  (standard colour matrix)
-                11 : rom = 16'h50_B3;  // MTX2
-                12 : rom = 16'h51_00;  // MTX3
-                13 : rom = 16'h52_3D;  // MTX4
-                14 : rom = 16'h53_A7;  // MTX5
-                15 : rom = 16'h54_E4;  // MTX6
-                16 : rom = 16'h58_9E;  // MTXS (matrix sign)
-                17 : rom = 16'h3D_C0;  // COM13: gamma enable + UV auto
+                7  : rom = 16'h40_D0;  // COM15: full range [00,FF] + RGB565 format
+                8  : rom = 16'h3A_04;  // TSLB: normal output byte order
+                9  : rom = 16'h14_18;  // COM9: AGC ceiling 4x (was 16x — R was clipping)
+                10 : rom = 16'h4F_80;  // MTX1  — RGB565 colour-correction matrix
+                11 : rom = 16'h50_80;  // MTX2    (standard values from OV7670 app note;
+                12 : rom = 16'h51_00;  // MTX3     these differ from the YUV BT.601 set
+                13 : rom = 16'h52_22;  // MTX4     that was here before and caused the
+                14 : rom = 16'h53_5E;  // MTX5     magenta/orange colour cast)
+                15 : rom = 16'h54_80;  // MTX6
+                16 : rom = 16'h58_1E;  // MTXS: matrix sign bits, auto-coeff OFF (bit7=0)
+                17 : rom = 16'h3D_88;  // COM13: gamma ON, UV-saturation-auto OFF (RGB mode)
                 18 : rom = 16'h17_13;  // HSTART
                 19 : rom = 16'h18_01;  // HSTOP
                 20 : rom = 16'h32_B6;  // HREF low bits
@@ -76,7 +77,7 @@ module ov7670_init #(
                 24 : rom = 16'h0E_61;  // COM5
                 25 : rom = 16'h0F_4B;  // COM6
                 26 : rom = 16'h16_02;  // reserved (leave default)
-                27 : rom = 16'h1E_07;  // MVFP: normal. Use 0x37 to flip image.
+                27 : rom = 16'h1E_27;  // MVFP: horizontal mirror ON (0x07 normal, 0x37 flip, 0x27 mirror, 0x17 both)
                 28 : rom = 16'h21_02;  // ADCCTR1
                 29 : rom = 16'h22_91;  // ADCCTR2
                 30 : rom = 16'h29_07;  // reserved
@@ -103,6 +104,19 @@ module ov7670_init #(
                 51 : rom = 16'hB2_0E;
                 52 : rom = 16'hB3_82;  // THL_ST
                 53 : rom = 16'hB8_0A;
+                // ---- AWB OFF: manual gains (more stable across scene content) ----
+                54 : rom = 16'h13_E5;  // COM8: AGC+AEC on, AWB OFF (bit1=0)
+                // ---- manual white-balance gains ----
+                55 : rom = 16'h01_A0;  // BLUE gain  ~1.25x  (filter test: clean signal)
+                56 : rom = 16'h02_80;  // RED  gain  ~1.0x   (filter test: was clipping at 1.44x)
+                // ---- camera-side noise reduction ----
+                57 : rom = 16'h3F_00;  // EDGE: edge enhancement OFF (was amplifying noise)
+                58 : rom = 16'h4C_20;  // DNSTH: denoise threshold (stronger, was 0x10)
+                59 : rom = 16'h77_0A;  // DENOISE: enable + stronger (was 0x05)
+                60 : rom = 16'h41_38;  // COM16: AWB-gain enable + denoise enable bit
+                // ---- contrast / brightness ----
+                61 : rom = 16'h56_40;  // CONTRAS: 1.0x = default (was 0x50, amplified noise)
+                62 : rom = 16'h55_00;  // BRIGHT: no brightness offset
                 default: rom = 16'hFF_FF;
             endcase
         end
